@@ -33,6 +33,38 @@ test("health endpoint confirms the API is running", async () => {
   assert.deepEqual(await response.json(), { status: "ok" });
 });
 
+test("CORS echoes allowed origins and preflight succeeds", async () => {
+  const allowed = process.env.FRONTEND_ORIGINS?.split(",").map((o) => o.trim()) ?? [];
+
+  for (const origin of allowed) {
+    const preflight = await fetch(`${baseUrl}/api/contact`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: origin,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+      },
+    });
+    assert.equal(preflight.status, 204, `preflight should succeed for ${origin}`);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
+
+    const simple = await fetch(`${baseUrl}/health`, { headers: { Origin: origin } });
+    assert.equal(simple.headers.get("access-control-allow-origin"), origin);
+  }
+});
+
+test("CORS does not echo an origin outside the allowlist", async () => {
+  const preflight = await fetch(`${baseUrl}/api/contact`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://evil.example.com",
+      "Access-Control-Request-Method": "POST",
+    },
+  });
+
+  assert.equal(preflight.headers.get("access-control-allow-origin"), null);
+});
+
 test("normalizeApiKey strips a stray auth prefix so it is never sent twice", async () => {
   const { normalizeApiKey } = await import("../src/server.js");
 

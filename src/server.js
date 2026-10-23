@@ -7,10 +7,23 @@ import { SendMailClient } from "zeptomail";
 import { createHash, randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 4000);
+
+// Origins are compared in their canonical form (lowercased, no trailing
+// slash) so a stray "/" or mixed case in FRONTEND_ORIGINS cannot silently
+// fail a match. Both the apex and "www" host are listed because the site is
+// reachable on either; browsers send the exact origin they were served from.
+function canonicalOrigin(value) {
+  return String(value || "").trim().toLowerCase().replace(/\/+$/, "");
+}
+
 const origins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000")
   .split(",")
-  .map((origin) => origin.trim())
+  .map(canonicalOrigin)
   .filter(Boolean);
+
+function isAllowedOrigin(origin) {
+  return Boolean(origin) && origins.includes(canonicalOrigin(origin));
+}
 
 // The ZeptoMail authorisation header is "Zoho-enczapikey <key>". Users often
 // paste the key straight from the ZeptoMail dashboard with that prefix already
@@ -368,7 +381,9 @@ export function createApp({ sendEmail = sendZeptoMail } = {}) {
   app.use(helmet());
   app.use(cors({
     origin(origin, callback) {
-      callback(null, !origin || origins.includes(origin));
+      // Requests with no Origin (curl, server-to-server, health checks) are
+      // allowed; browser requests are checked against the allowlist.
+      callback(null, !origin || isAllowedOrigin(origin));
     },
   }));
   app.use(express.json({ limit: "16kb" }));

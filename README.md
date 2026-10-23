@@ -46,6 +46,29 @@ Both submission endpoints have per-IP rate limits and input validation. The news
 
 When ZeptoMail rejects a send, the backend logs the request ID, delivery stage, and safe provider error fields. Authorization details and submitted contact information are not logged; clients receive a generic error response if the enquiry notification itself fails. If the enquiry notification succeeds but the visitor acknowledgement fails, the API logs the acknowledgement failure and still confirms receipt to prevent duplicate submissions. Use the `X-Request-Id` response header to match a failed request to its backend log entry.
 
+## Troubleshooting CORS
+
+Browsers send a preflight `OPTIONS` request before `POST /api/contact` and `POST /api/newsletter`. The origin must appear in `FRONTEND_ORIGINS`, otherwise the preflight gets no `Access-Control-Allow-Origin` header and the browser blocks the call with:
+
+```
+No 'Access-Control-Allow-Origin' header is present on the requested resource
+```
+
+List **every** host the frontend is served from, including the apex domain if the site is reachable without `www` — `https://patientsflow.co.uk` and `https://www.patientsflow.co.uk` are different origins. Origins are compared lowercased and without a trailing slash.
+
+`FRONTEND_ORIGINS` must be set in the hosting environment (for example the Render dashboard); `.env` is not committed and is not read in production.
+
+Verify an origin against a running instance:
+
+```powershell
+curl.exe -sS -D - -o NUL -X OPTIONS `
+  -H "Origin: https://patientsflow.co.uk" `
+  -H "Access-Control-Request-Method: POST" `
+  http://localhost:4000/api/contact
+```
+
+A configured origin returns `204` with `access-control-allow-origin`; an unlisted one returns `404` with no CORS headers.
+
 ## Test
 
 ```powershell
