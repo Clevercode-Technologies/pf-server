@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
+import { SendMailClient } from "zeptomail";
 
 process.env.NODE_ENV = "test";
 process.env.ZEPTOMAIL_API_KEY = "test-zeptomail-key";
-const { createApp } = await import("../src/server.js");
+const { createApp, preserveProviderHttpStatus } = await import("../src/server.js");
 
 let sentEmails = [];
 let server;
@@ -30,6 +31,45 @@ test("health endpoint confirms the API is running", async () => {
 
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { status: "ok" });
+});
+
+test("normalizeApiKey strips a stray auth prefix so it is never sent twice", async () => {
+  const { normalizeApiKey } = await import("../src/server.js");
+
+  // The bug: pasting the dashboard value with its "Zoho-enczapikey " prefix,
+  // then sending the prefix again, made Zoho reply 500 with an empty body.
+  assert.equal(normalizeApiKey("Zoho-enczapikey abc123"), "abc123");
+  assert.equal(normalizeApiKey("zoho-enczapikey abc123"), "abc123");
+  assert.equal(normalizeApiKey("abc123"), "abc123");
+  assert.equal(normalizeApiKey("  abc123  "), "abc123");
+  assert.equal(normalizeApiKey(""), "");
+  assert.equal(normalizeApiKey(undefined), "");
+  // Idempotent: running it again on an already-bare key changes nothing.
+  assert.equal(normalizeApiKey(normalizeApiKey("Zoho-enczapikey abc123")), "abc123");
+});
+
+test("ZeptoMail SDK handles empty error bodies without an unhandled JSON rejection", async () => {
+  const client = new SendMailClient({
+    url: "https://cpaas.zoho.com/v1.1/email",
+    token: "Zoho-enczapikey test-token",
+  });
+  preserveProviderHttpStatus(client);
+
+  const response = {
+    ok: false,
+    status: 500,
+    statusText: "Internal Server Error",
+    async json() {
+      throw new SyntaxError("Unexpected end of JSON input");
+    },
+  };
+
+  await assert.rejects(client.httpRequest(Promise.resolve(response)), (error) =>
+    error.statusCode === 500 &&
+    error.statusText === "Internal Server Error" &&
+    error.message === "Provider returned an empty or non-JSON error response." &&
+    typeof error.json === "undefined",
+  );
 });
 
 test("contact form sends an inbox email and an acknowledgement", async () => {
@@ -131,22 +171,25 @@ test("newsletter requires explicit consent and confirms a valid subscription", a
   assert.equal(sentEmails[1].to.address, "jane@example.com");
 });
 
-test("ZeptoMail failures log safe provider diagnostics and keep the response generic", async () => {
+test("contact notification failures log the delivery stage and keep the response generic", async () => {
   const originalFetch = globalThis.fetch;
   const originalConsoleError = console.error;
   const loggedErrors = [];
-  globalThis.fetch = async () =>
-    new Response(
-      JSON.stringify({
-        code: "INVALID_AGENT_KEY",
-        message: "Request rejected for jane@example.com",
-      }),
-      { status: 500, statusText: "Internal Server Error" },
-    );
+  const sendEmail = async () => {
+    const error = new Error("ZeptoMail email request failed.");
+    error.providerDetails = {
+      response: {
+        statusCode: 500,
+        error_code: "INVALID_AGENT_KEY",
+        message: "Provider rejected request for [redacted email].",
+      },
+    };
+    throw error;
+  };
   console.error = (...args) => loggedErrors.push(args);
 
   try {
-    const appServer = createApp().listen(0);
+    const appServer = createApp({ sendEmail }).listen(0);
     await new Promise((resolve) => appServer.once("listening", resolve));
     const appUrl = `http://127.0.0.1:${appServer.address().port}`;
     const response = await originalFetch(`${appUrl}/api/contact`, {
@@ -174,10 +217,60 @@ test("ZeptoMail failures log safe provider diagnostics and keep the response gen
 
     const logOutput = JSON.stringify(loggedErrors[0]);
     assert.match(logOutput, /INVALID_AGENT_KEY/);
-    assert.match(logOutput, /HTTP 500/);
+    assert.match(logOutput, /contact_notification/);
+    assert.match(logOutput, /statusCode/);
     assert.doesNotMatch(logOutput, /jane@example\.com|test-zeptomail-key|Private enquiry details/);
   } finally {
-    globalThis.fetch = originalFetch;
     console.error = originalConsoleError;
+  }
+});
+
+test("failed visitor acknowledgement does not report an accepted enquiry as failed", async () => {
+  const originalConsoleWarn = console.warn;
+  const loggedWarnings = [];
+  let appServer;
+  let sendCount = 0;
+  const sendEmail = async () => {
+    sendCount += 1;
+    if (sendCount === 2) {
+      const error = new Error("ZeptoMail email request failed.");
+      error.providerDetails = {
+        response: { statusCode: 500, message: "Temporary provider failure" },
+      };
+      throw error;
+    }
+  };
+  console.warn = (...args) => loggedWarnings.push(args);
+
+  try {
+    appServer = createApp({ sendEmail }).listen(0);
+    await new Promise((resolve) => appServer.once("listening", resolve));
+    const appUrl = `http://127.0.0.1:${appServer.address().port}`;
+    const response = await fetch(`${appUrl}/api/contact`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "Jane Smith",
+        email: "jane@example.com",
+        phone: "+447123456789",
+        countryCode: "+44",
+        enquiry: "Please send more information.",
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      message: "Your message has been sent.",
+    });
+    assert.equal(sendCount, 2);
+    assert.equal(loggedWarnings.length, 1);
+    assert.match(JSON.stringify(loggedWarnings[0]), /contact_acknowledgement/);
+  } finally {
+    console.warn = originalConsoleWarn;
+    if (appServer?.listening) {
+      await new Promise((resolve, reject) => {
+        appServer.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
   }
 });

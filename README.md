@@ -1,6 +1,6 @@
 # Patients Flow mail API
 
-Small Express service for the website contact form and newsletter sign-ups. It sends messages through the ZeptoMail transactional email API; the API key stays on the server.
+Small Express service for the website contact form and newsletter sign-ups. It sends messages through the ZeptoMail Node.js SDK; the API key stays on the server.
 
 ## Requirements
 
@@ -14,9 +14,17 @@ npm install
 Copy-Item .env.example .env
 ```
 
-Set `ZEPTOMAIL_API_KEY` in `.env` to the API key for the configured ZeptoMail agent. The sender address must be verified in ZeptoMail. Keep `.env` private and do not commit it.
+Set `ZEPTOMAIL_API_KEY` in `.env` to the API key for the configured ZeptoMail agent. The key may be pasted with or without the leading `Zoho-enczapikey ` prefix shown in the ZeptoMail dashboard; the server strips a stray prefix and adds it exactly once. Sending the prefix twice makes Zoho answer with an opaque HTTP 500 and an empty response body. The sender address must be verified in ZeptoMail. Keep `.env` private and do not commit it.
 
-The ZeptoMail send endpoint uses the agent-specific API key for authentication; it does not require a separate agent-alias field in the message request.
+The ZeptoMail SDK sends through the agent-specific API key; it does not require a separate agent-alias field in the message request. The API logs a startup configuration summary and delivery stage for mail failures. It never logs the API key or submitted contact details.
+
+## Logging
+
+Set `LOG_LEVEL` in `.env` to `error`, `warn`, `info`, or `debug`. Outside production the default is `debug`, so `npm run dev` prints the full mail trail; production defaults to `info`.
+
+On startup the API runs a credential self-check against ZeptoMail and logs `credentials accepted`, `AUTH FAILED`, or `PROVIDER ERROR` with an actionable hint. The startup summary includes `apiKeyHadAuthPrefix` (a stray prefix in `.env`), `apiKeyFingerprint` (a short hash confirming which key is loaded, never the key itself), and `apiKeyLength`.
+
+Each send logs `send.request` and `send.success` with the endpoint, subject, recipient domain, duration, and the provider request ID to quote in a ZeptoMail support ticket. Failures log the request ID, delivery stage, HTTP status, and a body snippet alongside the safe provider error fields.
 
 ## Run
 
@@ -24,7 +32,7 @@ The ZeptoMail send endpoint uses the agent-specific API key for authentication; 
 npm run dev
 ```
 
-The API listens on `http://localhost:4000` by default. Set `NEXT_PUBLIC_API_URL` in the frontend to the deployed API origin and update `FRONTEND_ORIGINS` to the exact frontend origins.
+The API listens on `http://localhost:4000` by default. `npm run dev` uses nodemon to restart the server when files change. Set `NEXT_PUBLIC_API_URL` in the frontend to the deployed API origin and update `FRONTEND_ORIGINS` to the exact frontend origins.
 
 ## Endpoints
 
@@ -36,7 +44,7 @@ Both submission endpoints have per-IP rate limits and input validation. The news
 
 ## Troubleshooting email delivery
 
-When ZeptoMail rejects a send, the backend logs the HTTP status, safe provider error fields, and a request ID. Authorization details and submitted contact information are redacted; clients still receive a generic error response. Use the `X-Request-Id` response header to match a failed request to its backend log entry.
+When ZeptoMail rejects a send, the backend logs the request ID, delivery stage, and safe provider error fields. Authorization details and submitted contact information are not logged; clients receive a generic error response if the enquiry notification itself fails. If the enquiry notification succeeds but the visitor acknowledgement fails, the API logs the acknowledgement failure and still confirms receipt to prevent duplicate submissions. Use the `X-Request-Id` response header to match a failed request to its backend log entry.
 
 ## Test
 

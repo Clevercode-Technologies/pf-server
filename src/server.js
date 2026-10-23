@@ -3,20 +3,84 @@ import cors from "cors";
 import express from "express";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
-import { randomUUID } from "node:crypto";
+import { SendMailClient } from "zeptomail";
+import { createHash, randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 4000);
 const origins = (process.env.FRONTEND_ORIGINS || "http://localhost:3000")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+
+// The ZeptoMail authorisation header is "Zoho-enczapikey <key>". Users often
+// paste the key straight from the ZeptoMail dashboard with that prefix already
+// attached. Sending the prefix twice makes Zoho's gateway answer with an
+// opaque HTTP 500 and an empty body, so normalise the configured value down to
+// the bare key and attach the prefix exactly once below.
+const AUTH_HEADER_PREFIX = "Zoho-enczapikey";
+
+export function normalizeApiKey(value) {
+  return (value || "")
+    .trim()
+    .replace(new RegExp(`^${AUTH_HEADER_PREFIX}\\s+`, "i"), "")
+    .trim();
+}
+
+const rawApiKey = (process.env.ZEPTOMAIL_API_KEY || "").trim();
 const mailConfig = {
   host: (process.env.ZEPTOMAIL_HOST || "https://cpaas.zoho.com").replace(/\/$/, ""),
-  apiKey: process.env.ZEPTOMAIL_API_KEY,
+  apiKey: normalizeApiKey(process.env.ZEPTOMAIL_API_KEY),
   fromAddress: process.env.MAIL_FROM_ADDRESS || "contact@app.patientsflow.co.uk",
   fromName: process.env.MAIL_FROM_NAME || "Patients Flow",
   inbox: process.env.CONTACT_INBOX || "contact@app.patientsflow.co.uk",
 };
+const mailUrl = `${mailConfig.host}/v1.1/email`;
+const mailToken = mailConfig.apiKey
+  ? `${AUTH_HEADER_PREFIX} ${mailConfig.apiKey}`
+  : null;
+const mailTimeoutMs = Number(process.env.MAIL_TIMEOUT_MS || 30000);
+const mailClient = mailConfig.apiKey
+  ? new SendMailClient({ url: mailUrl, token: mailToken })
+  : null;
+if (mailClient) {
+  preserveProviderHttpStatus(mailClient);
+}
+
+// Logging levels: error > warn > info > debug. Failures always log; per-send
+// detail (endpoint, timing, provider response codes) logs at debug, which is
+// the default outside production so `npm run dev` shows the full trail.
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
+const defaultLogLevel =
+  process.env.NODE_ENV === "test"
+    ? "error"
+    : process.env.NODE_ENV === "production"
+      ? "info"
+      : "debug";
+const logLevelName = (process.env.LOG_LEVEL || defaultLogLevel).toLowerCase();
+const logLevel = LOG_LEVELS[logLevelName] ?? LOG_LEVELS.info;
+
+function logAt(levelName, label, details) {
+  if (logLevel < LOG_LEVELS[levelName]) return;
+  const method = levelName === "error" || levelName === "warn" ? levelName : "info";
+  console[method](`[mail:${levelName}] ${label}`, details);
+}
+
+const logDebug = (label, details) => logAt("debug", label, details);
+const logInfo = (label, details) => logAt("info", label, details);
+
+// Logs only the domain part of an address so failures stay traceable without
+// writing visitor contact details to the log stream.
+function addressDomain(address) {
+  const value = typeof address === "string" ? address.trim() : "";
+  const at = value.lastIndexOf("@");
+  return at === -1 ? null : value.slice(at + 1).toLowerCase() || null;
+}
+
+// Short, stable fingerprint of the loaded key. Lets an operator confirm which
+// key the process is using without ever printing the key itself.
+function keyFingerprint(key) {
+  return key ? createHash("sha256").update(key).digest("hex").slice(0, 8) : null;
+}
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const e164Pattern = /^\+[1-9]\d{7,14}$/;
@@ -46,17 +110,84 @@ function mailAddress(address, name) {
   };
 }
 
+export function preserveProviderHttpStatus(client) {
+  const originalStatus = client.status.bind(client);
+  client.status = (response) => {
+    if (!response.ok) {
+      const parseJson = response.json.bind(response);
+      response.json = async () => {
+        // Read the raw body first (when available) so an empty or non-JSON
+        // reply still leaves a snippet in the log instead of a bare 500.
+        let rawBody = "";
+        let readRawBody = false;
+        try {
+          if (typeof response.text === "function") {
+            rawBody = await response.text();
+            readRawBody = true;
+          }
+        } catch {
+          readRawBody = false;
+        }
+
+        let data;
+        if (readRawBody) {
+          try {
+            data = rawBody ? JSON.parse(rawBody) : undefined;
+          } catch {
+            data = undefined;
+          }
+        } else {
+          try {
+            data = await parseJson();
+          } catch {
+            data = undefined;
+          }
+        }
+
+        const extras = {
+          statusCode: response.status,
+          statusText: response.statusText,
+        };
+
+        if (data && typeof data === "object" && !Array.isArray(data)) {
+          return { ...data, ...extras };
+        }
+        if (Array.isArray(data)) {
+          return { data, ...extras };
+        }
+
+        return {
+          message: "Provider returned an empty or non-JSON error response.",
+          responseBody: rawBody ? rawBody.slice(0, 300) : "",
+          ...extras,
+        };
+      };
+    }
+
+    return originalStatus(response);
+  };
+  return client;
+}
+
 function safeProviderDetails(body, sensitiveValues) {
   const allowedKeys = new Set([
+    "name",
     "code",
     "error_code",
     "errorCode",
     "status",
     "request_id",
     "requestId",
+    "statusCode",
+    "status_code",
+    "statusText",
     "message",
     "error",
     "description",
+    "data",
+    "details",
+    "response",
+    "responseBody",
   ]);
 
   const redact = (value) => {
@@ -96,17 +227,20 @@ function safeProviderDetails(body, sensitiveValues) {
 }
 
 async function sendZeptoMail({ to, subject, text, html, replyTo }) {
-  if (!mailConfig.apiKey) {
+  if (!mailClient) {
     throw new Error("ZeptoMail API key is not configured.");
   }
 
-  const response = await fetch(`${mailConfig.host}/v1.1/email`, {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-enczapikey ${mailConfig.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
+  const startedAt = Date.now();
+  logDebug("send.request", {
+    endpoint: mailUrl,
+    subject,
+    toDomain: addressDomain(to.address),
+    hasReplyTo: Boolean(replyTo),
+  });
+
+  try {
+    const result = await mailClient.sendMail({
       from: { address: mailConfig.fromAddress, name: mailConfig.fromName },
       to: [mailAddress(to.address, to.name)],
       ...(replyTo ? { reply_to: [{ address: replyTo.address, name: replyTo.name }] } : {}),
@@ -115,18 +249,37 @@ async function sendZeptoMail({ to, subject, text, html, replyTo }) {
       htmlbody: html,
       track_clicks: false,
       track_opens: false,
-    }),
-    signal: AbortSignal.timeout(10000),
-  });
-
-  if (!response.ok) {
-    const responseBody = await response.text();
-    const error = new Error(`ZeptoMail request failed with HTTP ${response.status}.`);
-    error.providerDetails = {
-      status: response.status,
-      statusText: response.statusText,
-      response: safeProviderDetails(responseBody, [
+    });
+    logDebug("send.success", {
+      endpoint: mailUrl,
+      subject,
+      durationMs: Date.now() - startedAt,
+      providerRequestId: result?.request_id ?? null,
+    });
+    return result;
+  } catch (error) {
+    const durationMs = Date.now() - startedAt;
+    const details = error instanceof Error
+      ? {
+          name: error.name,
+          message: error.message,
+          statusCode: error.statusCode,
+          statusText: error.statusText,
+          code: error.code,
+          data: error.data,
+          response: error.response,
+        }
+      : error && typeof error === "object"
+        ? error
+        : { message: error };
+    const providerResponse = JSON.stringify(details);
+    const mailError = new Error("ZeptoMail email request failed.");
+    mailError.providerDetails = {
+      response: safeProviderDetails(providerResponse, [
         mailConfig.apiKey,
+        rawApiKey,
+        mailToken,
+        `${AUTH_HEADER_PREFIX} ${mailConfig.apiKey}`,
         to.address,
         to.name,
         replyTo?.address,
@@ -136,7 +289,65 @@ async function sendZeptoMail({ to, subject, text, html, replyTo }) {
         html,
       ]),
     };
-    throw error;
+    mailError.mailDiagnostics = {
+      endpoint: mailUrl,
+      subject,
+      toDomain: addressDomain(to.address),
+      durationMs,
+      httpStatus: typeof details?.statusCode === "number" ? details.statusCode : null,
+    };
+    throw mailError;
+  }
+}
+
+function logConfiguration() {
+  console.info("Mail API configuration:", {
+    environment: process.env.NODE_ENV || "development",
+    port: PORT,
+    logLevel: logLevelName,
+    frontendOrigins: origins,
+    zeptoMail: {
+      endpoint: mailUrl,
+      apiKeyConfigured: Boolean(mailConfig.apiKey),
+      // Logs how the key was stored so a stray "Zoho-enczapikey " prefix in
+      // .env is visible immediately; the key itself is never printed.
+      apiKeyHadAuthPrefix: /^Zoho-enczapikey\s+/i.test(rawApiKey),
+      apiKeyFingerprint: keyFingerprint(mailConfig.apiKey),
+      apiKeyLength: mailConfig.apiKey ? mailConfig.apiKey.length : 0,
+      mailTimeoutMs,
+      fromAddress: mailConfig.fromAddress,
+      fromName: mailConfig.fromName,
+      contactInbox: mailConfig.inbox,
+    },
+  });
+}
+
+function logMailFailure(level, { requestId, stage, error }) {
+  const safeError = safeProviderDetails(JSON.stringify({
+    name: error?.name || "Error",
+    message: error?.message || "Unknown email delivery error",
+  }), [mailConfig.apiKey, rawApiKey, mailToken]);
+
+  console[level]("Email delivery failed:", {
+    requestId,
+    stage,
+    error: safeError,
+    ...(error?.mailDiagnostics ? { diagnostics: error.mailDiagnostics } : {}),
+    ...(error?.providerDetails ? { provider: error.providerDetails } : {}),
+  });
+}
+
+async function sendEmailForStage(sendEmail, message, stage) {
+  try {
+    await sendEmail(message);
+  } catch (error) {
+    if (error && typeof error === "object") {
+      error.mailStage = stage;
+      throw error;
+    }
+    const stagedError = new Error(String(error || "Unknown email delivery error"));
+    stagedError.mailStage = stage;
+    throw stagedError;
   }
 }
 
@@ -164,7 +375,17 @@ export function createApp({ sendEmail = sendZeptoMail } = {}) {
 
   app.use((request, response, next) => {
     request.requestId = randomUUID();
+    request.startedAt = Date.now();
     response.setHeader("X-Request-Id", request.requestId);
+    response.on("finish", () => {
+      logDebug("http.request", {
+        requestId: request.requestId,
+        method: request.method,
+        path: request.path,
+        statusCode: response.statusCode,
+        durationMs: Date.now() - request.startedAt,
+      });
+    });
     next();
   });
 
@@ -198,21 +419,29 @@ export function createApp({ sendEmail = sendZeptoMail } = {}) {
       const safePhone = escapeHtml(phone);
       const safeEnquiry = escapeHtml(enquiry).replace(/\n/g, "<br>");
 
-      await sendEmail({
+      await sendEmailForStage(sendEmail, {
         to: { address: mailConfig.inbox },
         replyTo: { address: email, name },
         subject: "New website enquiry",
         text: `Name: ${name}\nEmail: ${email}\nPhone: ${phone}\n\nEnquiry:\n${enquiry}`,
         html: `<h2>Website enquiry</h2><p><strong>Name:</strong> ${safeName}</p><p><strong>Email:</strong> ${safeEmail}</p><p><strong>Phone:</strong> ${safePhone}</p><p><strong>Enquiry:</strong><br>${safeEnquiry}</p>`,
-      });
+      }, "contact_notification");
 
-      await sendEmail({
-        to: { address: email, name },
-        replyTo: { address: mailConfig.inbox, name: mailConfig.fromName },
-        subject: "We received your message | Patients Flow",
-        text: `Hello ${name},\n\nThank you for contacting Patients Flow. We have received your enquiry, and our team will get back to you shortly.\n\nYour submitted enquiry:\n${enquiry}\n\nIf you need to add anything, reply to this email and your message will reach our team.\n\nKind regards,\nPatients Flow\n${mailConfig.inbox}`,
-        html: `<div style="margin:0;padding:32px 16px;background-color:#f4f7fa;font-family:Arial,Helvetica,sans-serif;color:#0f1d39"><div style="max-width:600px;margin:0 auto;background-color:#ffffff;border:1px solid #e5eaf0;border-radius:12px;overflow:hidden"><div style="padding:24px 32px;background-color:#0f1d39;color:#ffffff"><p style="margin:0;font-size:13px;letter-spacing:1px;text-transform:uppercase;color:#9ce1dc">Patients Flow</p><h1 style="margin:12px 0 0;font-size:24px;line-height:1.3">We received your enquiry</h1></div><div style="padding:28px 32px"><p style="margin:0 0 16px">Hello ${safeName},</p><p style="margin:0 0 20px;line-height:1.6">Thank you for contacting Patients Flow. Our team has received your message and will get back to you shortly.</p><div style="padding:18px 20px;background-color:#f4f7fa;border-radius:8px"><p style="margin:0 0 10px;font-size:14px;font-weight:bold">Your submitted enquiry</p><p style="margin:0;line-height:1.6;white-space:normal">${safeEnquiry}</p></div><p style="margin:20px 0 0;line-height:1.6">If you need to add anything, reply to this email and your message will reach our team.</p><p style="margin:24px 0 0;line-height:1.6">Kind regards,<br><strong>Patients Flow</strong><br><a href="mailto:${escapeHtml(mailConfig.inbox)}" style="color:#087f79">${escapeHtml(mailConfig.inbox)}</a></p></div></div></div>`,
-      });
+      try {
+        await sendEmailForStage(sendEmail, {
+          to: { address: email, name },
+          replyTo: { address: mailConfig.inbox, name: mailConfig.fromName },
+          subject: "We received your message | Patients Flow",
+          text: `Hello ${name},\n\nThank you for contacting Patients Flow. We have received your enquiry, and our team will get back to you shortly.\n\nYour submitted enquiry:\n${enquiry}\n\nIf you need to add anything, reply to this email and your message will reach our team.\n\nKind regards,\nPatients Flow\n${mailConfig.inbox}`,
+          html: `<div style="margin:0;padding:32px 16px;background-color:#f4f7fa;font-family:Arial,Helvetica,sans-serif;color:#0f1d39"><div style="max-width:600px;margin:0 auto;background-color:#ffffff;border:1px solid #e5eaf0;border-radius:12px;overflow:hidden"><div style="padding:24px 32px;background-color:#0f1d39;color:#ffffff"><p style="margin:0;font-size:13px;letter-spacing:1px;text-transform:uppercase;color:#9ce1dc">Patients Flow</p><h1 style="margin:12px 0 0;font-size:24px;line-height:1.3">We received your enquiry</h1></div><div style="padding:28px 32px"><p style="margin:0 0 16px">Hello ${safeName},</p><p style="margin:0 0 20px;line-height:1.6">Thank you for contacting Patients Flow. Our team has received your message and will get back to you shortly.</p><div style="padding:18px 20px;background-color:#f4f7fa;border-radius:8px"><p style="margin:0 0 10px;font-size:14px;font-weight:bold">Your submitted enquiry</p><p style="margin:0;line-height:1.6;white-space:normal">${safeEnquiry}</p></div><p style="margin:20px 0 0;line-height:1.6">If you need to add anything, reply to this email and your message will reach our team.</p><p style="margin:24px 0 0;line-height:1.6">Kind regards,<br><strong>Patients Flow</strong><br><a href="mailto:${escapeHtml(mailConfig.inbox)}" style="color:#087f79">${escapeHtml(mailConfig.inbox)}</a></p></div></div></div>`,
+        }, "contact_acknowledgement");
+      } catch (error) {
+        logMailFailure("warn", {
+          requestId: request.requestId,
+          stage: error?.mailStage || "contact_acknowledgement",
+          error,
+        });
+      }
 
       return response.status(200).json({ message: "Your message has been sent." });
     } catch (error) {
@@ -256,16 +485,10 @@ export function createApp({ sendEmail = sendZeptoMail } = {}) {
   });
 
   app.use((error, request, response, _next) => {
-    console.error("Request failed:", {
+    logMailFailure("error", {
       requestId: request.requestId,
-      method: request.method,
-      path: request.path,
-      error: {
-        name: error.name,
-        message: error.message,
-        stack: error.stack,
-      },
-      ...(error.providerDetails ? { provider: error.providerDetails } : {}),
+      stage: error?.mailStage || "request",
+      error,
     });
     if (response.headersSent) return;
     response.status(500).json({ error: "Unable to process your request right now. Please try again later." });
@@ -274,8 +497,69 @@ export function createApp({ sendEmail = sendZeptoMail } = {}) {
   return app;
 }
 
+// Lightweight startup probe: sends an intentionally invalid (empty) payload.
+// The provider validates credentials before the payload, so:
+//   401/403  -> auth problem (bad key, wrong data centre)
+//   4xx      -> credentials OK, payload was the only problem (expected here)
+//   5xx      -> provider/gateway problem
+// This never delivers an email, but confirms the key and host are usable.
+async function selfCheckZeptoMail() {
+  if (!mailClient) {
+    console.warn("[mail:selfcheck] skipped", {
+      reason: "ZEPTOMAIL_API_KEY is not configured.",
+    });
+    return;
+  }
+
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(mailUrl, {
+      method: "POST",
+      headers: {
+        Authorization: mailToken,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+      signal: AbortSignal.timeout(mailTimeoutMs),
+    });
+    const bodyText = await response.text().catch(() => "");
+    const summary = {
+      endpoint: mailUrl,
+      httpStatus: response.status,
+      durationMs: Date.now() - startedAt,
+      bodySnippet: bodyText.slice(0, 200),
+    };
+
+    if (response.status === 401 || response.status === 403) {
+      console.error("[mail:selfcheck] AUTH FAILED", {
+        ...summary,
+        hint: "The API key was rejected. Confirm ZEPTOMAIL_API_KEY matches the data centre in ZEPTOMAIL_HOST (for example cpaas.zoho.com for US, mail.zoho.eu for EU).",
+      });
+      return;
+    }
+    if (response.status >= 500) {
+      console.error("[mail:selfcheck] PROVIDER ERROR", {
+        ...summary,
+        hint: "The provider answered 5xx. An empty body here usually means a malformed Authorization header.",
+      });
+      return;
+    }
+    console.info("[mail:selfcheck] credentials accepted", summary);
+  } catch (error) {
+    console.error("[mail:selfcheck] REQUEST FAILED", {
+      endpoint: mailUrl,
+      durationMs: Date.now() - startedAt,
+      name: error?.name || "Error",
+      message: error?.message || String(error),
+      hint: "Could not reach the ZeptoMail host. Check network access and ZEPTOMAIL_HOST.",
+    });
+  }
+}
+
 if (process.env.NODE_ENV !== "test") {
+  logConfiguration();
   createApp().listen(PORT, () => {
     console.log(`Patients Flow mail API listening on port ${PORT}`);
   });
+  selfCheckZeptoMail();
 }
